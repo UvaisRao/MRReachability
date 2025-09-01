@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
 s.name         = "MRReachability"
-s.version = "1.0.3"
+s.version = "1.0.4"
 s.ios.frameworks = ["Network", "SystemConfiguration", "UIKit"]
 s.summary      = "NWPathMonitor-backed reachability with a legacy-style API."
 s.description  = <<-DESC
@@ -10,7 +10,7 @@ DESC
 
 s.homepage     = "https://github.com/UvaisRao/MRReachability"
 s.license      = { :type => "MIT", :file => "LICENSE" }
-s.author       = { "Uvais Khan" => "you@example.com" }
+s.author       = { "Uvais Khan" => "rao.khan@mrsool.co" }
 
 # IMPORTANT: iOS only for now to avoid cross-platform build failures
 s.platform     = :ios, "12.0"
