@@ -1,22 +1,15 @@
-//
-//  MRReachability.swift
-//  Pods
-//
-//  Created by Rao Uvais khan on 29/08/25.
-//
-
-
 import Foundation
 import Network
 import SystemConfiguration // kept only to satisfy legacy init signature; not used internally
-import UIKit
 
 // MARK: - Version symbols (kept for compatibility; you can fill these at build time if needed)
 public var ReachabilityVersionNumber: Double = 1.0
 public let ReachabilityVersionString: String = "MRReachability (NWPathMonitor-backed) 1.0.0"
 
-// MARK: - MRReachability (signature-compatible wrapper on top of NWPathMonitor)
-public class MRReachability: CustomStringConvertible {
+/// MRReachability: lightweight, NWPathMonitor-backed reachability with a legacy-style API.
+/// Available where Apple's Network framework is available.
+@available(iOS 12.0, macOS 10.14, tvOS 12.0, watchOS 5.0, *)
+public final class MRReachability: CustomStringConvertible {
 
     // MARK: Legacy callback aliases
     public typealias NetworkReachable   = (MRReachability) -> Void
@@ -47,7 +40,7 @@ public class MRReachability: CustomStringConvertible {
     @available(*, deprecated, renamed: "allowsCellularConnection")
     public let reachableOnWWAN: Bool = true
 
-    /// Set to `false` to force MRReachability.connection to .none/.unavailable when on cellular connection (default value `true`)
+    /// Set to `false` to force MRReachability.connection to .unavailable when on cellular connection (default `true`)
     public var allowsCellularConnection: Bool = true
 
     public var notificationCenter: NotificationCenter = .default
@@ -60,9 +53,9 @@ public class MRReachability: CustomStringConvertible {
         return map(path: path)
     }
 
-    // MARK: Legacy initializers
-    required public init(
-        reachabilityRef: SCNetworkReachability,
+    // MARK: Legacy-style initializers (kept for compatibility)
+    public init(
+        reachabilityRef _: SCNetworkReachability,
         queueQoS: DispatchQoS = .default,
         targetQueue: DispatchQueue? = nil,
         notificationQueue: DispatchQueue? = .main
@@ -79,7 +72,11 @@ public class MRReachability: CustomStringConvertible {
         targetQueue: DispatchQueue? = nil,
         notificationQueue: DispatchQueue? = .main
     ) throws {
-        let dummyRef = SCNetworkReachabilityCreateWithName(nil, hostname) ?? SCNetworkReachabilityCreateWithName(nil, "localhost")!
+        // Create a dummy SCNetworkReachabilityRef just to satisfy legacy signature; not used internally.
+        let chosenHost = hostname.isEmpty ? "localhost" : hostname
+        guard let dummyRef = SCNetworkReachabilityCreateWithName(nil, chosenHost) else {
+            throw MRReachabilityError.failedToCreateWithHostname(chosenHost, EINVAL)
+        }
         self.init(reachabilityRef: dummyRef, queueQoS: queueQoS, targetQueue: targetQueue, notificationQueue: notificationQueue)
     }
 
@@ -88,25 +85,25 @@ public class MRReachability: CustomStringConvertible {
         targetQueue: DispatchQueue? = nil,
         notificationQueue: DispatchQueue? = .main
     ) throws {
-        let addr = sockaddr_in(
+        var addr = sockaddr_in(
             sin_len: UInt8(MemoryLayout<sockaddr_in>.size),
             sin_family: sa_family_t(AF_INET),
             sin_port: in_port_t(0),
             sin_addr: in_addr(s_addr: 0),
             sin_zero: (0,0,0,0,0,0,0,0)
         )
-        var mutableAddr = addr
-        let ref = withUnsafePointer(to: &mutableAddr) {
+        let ref: SCNetworkReachability? = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                 SCNetworkReachabilityCreateWithAddress(nil, $0)
             }
-        }!
-        self.init(reachabilityRef: ref, queueQoS: queueQoS, targetQueue: targetQueue, notificationQueue: notificationQueue)
+        }
+        guard let safeRef = ref else {
+            throw MRReachabilityError.failedToCreateWithAddress(unsafeBitCast(addr, to: sockaddr.self), EINVAL)
+        }
+        self.init(reachabilityRef: safeRef, queueQoS: queueQoS, targetQueue: targetQueue, notificationQueue: notificationQueue)
     }
 
-    deinit {
-        stopNotifier()
-    }
+    deinit { stopNotifier() }
 
     // MARK: Notifier lifecycle
     public func startNotifier() throws {
@@ -120,8 +117,7 @@ public class MRReachability: CustomStringConvertible {
         monitor.start(queue: targetQueue)
 
         // Emit an initial snapshot immediately
-        let initialPath = monitor.currentPath
-        handlePathUpdate(initialPath)
+        handlePathUpdate(monitor.currentPath)
     }
 
     public func stopNotifier() {
@@ -132,7 +128,7 @@ public class MRReachability: CustomStringConvertible {
         latestPath = nil
     }
 
-    @available(*, deprecated, message: "Please use `connection != .none`")
+    @available(*, deprecated, message: "Please use `connection != .unavailable`")
     public var isReachable: Bool { connection != .unavailable }
 
     @available(*, deprecated, message: "Please use `connection == .cellular`")
