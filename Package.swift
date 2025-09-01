@@ -3,10 +3,7 @@ import PackageDescription
 let package = Package(
     name: "MRReachability",
     platforms: [
-        .iOS(.v12),
-        .macOS(.v10_14),
-        .tvOS(.v12),
-        .watchOS(.v5)
+        .iOS(.v12), .macOS(.v10_14), .tvOS(.v12), .watchOS(.v5)
     ],
     products: [
         .library(name: "MRReachability", targets: ["MRReachability"])
@@ -14,8 +11,9 @@ let package = Package(
     targets: [
         .target(
             name: "MRReachability",
-            dependencies: [],
-            path: "Sources/MRReachability"
+            path: "Sources/MRReachability",
+            linkerSettings: []
         )
     ]
 )
+
