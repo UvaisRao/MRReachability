@@ -1,196 +1,157 @@
+// MRReachability.swift
+// NWPathMonitor-backed, legacy-style Reachability surface.
+// Works on iOS 12+
+//
+// Notes for Swift 6:
+// - Immutable global constants (no shared mutable state)
+// - Class isolated to MainActor (UI-friendly notifications/callbacks)
+// - Enum is Sendable
+// - NWPathMonitor callback hops to MainActor via Task { @MainActor in … }
+
+// MRReachability.swift
+// NWPathMonitor-backed, legacy-style Reachability surface.
+// Supported: iOS 12+ / macOS 10.14+ / tvOS 12+ / watchOS 5+
+//
+// Swift 6 compatibility:
+//  - No @MainActor on the whole class (so CustomStringConvertible is satisfied).
+//  - Class is @unchecked Sendable to allow capture inside @Sendable closures;
+//    we hop to the main queue before touching callbacks/NotificationCenter.
+//  - Enum Connection is Sendable.
+//  - No use of Task { } (which needs iOS 13/macOS 10.15); we use DispatchQueue.main.async.
+//  - Availability is scoped on the class so older platforms compile apps that include this file,
+//    but the type itself is only available where Network.framework exists.
+
 import Foundation
 import Network
-import SystemConfiguration // kept only to satisfy legacy init signature; not used internally
 
-// MARK: - Version symbols (kept for compatibility; you can fill these at build time if needed)
-public var ReachabilityVersionNumber: Double = 1.0
-public let ReachabilityVersionString: String = "MRReachability (NWPathMonitor-backed) 1.0.0"
+#if canImport(UIKit)
+import UIKit
+#endif
 
-/// MRReachability: lightweight, NWPathMonitor-backed reachability with a legacy-style API.
-/// Available where Apple's Network framework is available.
+#if canImport(SystemConfiguration)
+import SystemConfiguration
+#endif
+
+// Public version symbols (compat with older Reachability headers)
+public let ReachabilityVersionNumber: Double = 1.0
+public let ReachabilityVersionString: String = "MRReachability 1.0.3"
+
+public extension Notification.Name {
+    static let reachabilityChanged = Notification.Name("reachabilityChanged")
+}
+
 @available(iOS 12.0, macOS 10.14, tvOS 12.0, watchOS 5.0, *)
-public final class MRReachability: CustomStringConvertible {
+public final class Reachability: @unchecked Sendable, CustomStringConvertible {
 
-    // MARK: Legacy callback aliases
-    public typealias NetworkReachable   = (MRReachability) -> Void
-    public typealias NetworkUnreachable = (MRReachability) -> Void
+    // MARK: - Legacy callback aliases
+    public typealias NetworkReachable   = (Reachability) -> Void
+    public typealias NetworkUnreachable = (Reachability) -> Void
 
-    // MARK: Legacy 3-state connection enum (mapped from NWPath)
-    public enum Connection: CustomStringConvertible {
+    // MARK: - Connection (legacy 3-state), Sendable for Swift 6
+    public enum Connection: String, Sendable, CustomStringConvertible {
         case unavailable
         case wifi
         case cellular
 
-        public var description: String {
-            switch self {
-            case .unavailable: return "unavailable"
-            case .wifi:        return "wifi"
-            case .cellular:    return "cellular"
-            }
-        }
+        // Some legacy code expects 'none'
+        public static let none: Connection = .unavailable
 
-        @available(*, deprecated, renamed: "unavailable")
-        public static let none: MRReachability.Connection = .unavailable
+        public var description: String { rawValue }
     }
 
-    // MARK: Public (legacy) surface
+    // MARK: - Public API
+    public var allowsCellularConnection: Bool = true
+
     public var whenReachable:   NetworkReachable?
     public var whenUnreachable: NetworkUnreachable?
 
-    @available(*, deprecated, renamed: "allowsCellularConnection")
-    public let reachableOnWWAN: Bool = true
-
-    /// Set to `false` to force MRReachability.connection to .unavailable when on cellular connection (default `true`)
-    public var allowsCellularConnection: Bool = true
-
-    public var notificationCenter: NotificationCenter = .default
-
-    @available(*, deprecated, renamed: "connection.description")
-    public var currentReachabilityString: String { connection.description }
-
+    /// Current connection (best-effort if notifier not started yet)
     public var connection: Connection {
-        guard let path = latestPath else { return .unavailable }
-        return map(path: path)
+        if let cached = lastStatus { return cached }
+        return Self.map(path: monitor.currentPath, allowsCellular: allowsCellularConnection)
     }
 
-    // MARK: Legacy-style initializers (kept for compatibility)
-    public init(
-        reachabilityRef _: SCNetworkReachability,
-        queueQoS: DispatchQoS = .default,
-        targetQueue: DispatchQueue? = nil,
-        notificationQueue: DispatchQueue? = .main
-    ) {
-        self.queueQoS = queueQoS
-        self.targetQueue = targetQueue ?? DispatchQueue(label: "mrreachability.monitor.queue", qos: queueQoS)
-        self.notificationQueue = notificationQueue ?? .main
+    public var description: String { connection.description }
+
+    // MARK: - Init (legacy surface kept)
+    public init?() {
         self.monitor = NWPathMonitor()
+        self.queue   = DispatchQueue(label: "com.mrsool.reachability.monitor")
     }
 
-    public convenience init(
-        hostname: String,
-        queueQoS: DispatchQoS = .default,
-        targetQueue: DispatchQueue? = nil,
-        notificationQueue: DispatchQueue? = .main
-    ) throws {
-        // Create a dummy SCNetworkReachabilityRef just to satisfy legacy signature; not used internally.
-        let chosenHost = hostname.isEmpty ? "localhost" : hostname
-        guard let dummyRef = SCNetworkReachabilityCreateWithName(nil, chosenHost) else {
-            throw MRReachabilityError.failedToCreateWithHostname(chosenHost, EINVAL)
-        }
-        self.init(reachabilityRef: dummyRef, queueQoS: queueQoS, targetQueue: targetQueue, notificationQueue: notificationQueue)
+    /// Legacy hostname initializer (NWPathMonitor doesn’t do host reachability; kept for API compat)
+    public convenience init?(hostname: String) {
+        self.init()
+        self.host = hostname
     }
 
-    public convenience init(
-        queueQoS: DispatchQoS = .default,
-        targetQueue: DispatchQueue? = nil,
-        notificationQueue: DispatchQueue? = .main
-    ) throws {
-        var addr = sockaddr_in(
-            sin_len: UInt8(MemoryLayout<sockaddr_in>.size),
-            sin_family: sa_family_t(AF_INET),
-            sin_port: in_port_t(0),
-            sin_addr: in_addr(s_addr: 0),
-            sin_zero: (0,0,0,0,0,0,0,0)
-        )
-        let ref: SCNetworkReachability? = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                SCNetworkReachabilityCreateWithAddress(nil, $0)
+    /// Legacy SCNetworkReachability initializer placeholder (kept for source compatibility)
+    public convenience init?(_ reachabilityRef: SCNetworkReachability?) {
+        self.init()
+    }
+
+    // MARK: - Notifier lifecycle
+    public func startNotifier() throws {
+        guard !notifierRunning else { return }
+
+        // NOTE: pathUpdateHandler is @Sendable. We capture `self` weakly and bounce to main queue
+        // before touching any state or calling user callbacks (UI-friendly).
+        monitor.pathUpdateHandler = { [weak self] path in
+            guard let strongSelf = self else { return }
+            let status = Self.map(path: path, allowsCellular: strongSelf.allowsCellularConnection)
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.lastStatus = status
+
+                switch status {
+                case .unavailable:
+                    self.whenUnreachable?(self)
+                case .wifi, .cellular:
+                    self.whenReachable?(self)
+                }
+
+                NotificationCenter.default.post(name: .reachabilityChanged, object: self)
             }
         }
-        guard let safeRef = ref else {
-            throw MRReachabilityError.failedToCreateWithAddress(unsafeBitCast(addr, to: sockaddr.self), EINVAL)
-        }
-        self.init(reachabilityRef: safeRef, queueQoS: queueQoS, targetQueue: targetQueue, notificationQueue: notificationQueue)
-    }
 
-    deinit { stopNotifier() }
-
-    // MARK: Notifier lifecycle
-    public func startNotifier() throws {
-        guard !isRunning else { return }
-        isRunning = true
-
-        monitor.pathUpdateHandler = { [weak self] path in
-            self?.handlePathUpdate(path)
-        }
-
-        monitor.start(queue: targetQueue)
-
-        // Emit an initial snapshot immediately
-        handlePathUpdate(monitor.currentPath)
+        monitor.start(queue: queue)
+        notifierRunning = true
     }
 
     public func stopNotifier() {
-        guard isRunning else { return }
-        isRunning = false
+        guard notifierRunning else { return }
         monitor.cancel()
-        monitor.pathUpdateHandler = nil
-        latestPath = nil
+        notifierRunning = false
+        lastStatus = nil
     }
 
-    @available(*, deprecated, message: "Please use `connection != .unavailable`")
-    public var isReachable: Bool { connection != .unavailable }
-
-    @available(*, deprecated, message: "Please use `connection == .cellular`")
-    public var isReachableViaWWAN: Bool { connection == .cellular }
-
-    @available(*, deprecated, message: "Please use `connection == .wifi`")
-    public var isReachableViaWiFi: Bool { connection == .wifi }
-
-    public var description: String {
-        "MRReachability(connection: \(connection.description), allowsCellular: \(allowsCellularConnection))"
+    deinit {
+        // Safe to call from deinit; we don’t require main actor here.
+        stopNotifier()
     }
 
     // MARK: - Internals
     private let monitor: NWPathMonitor
-    private let queueQoS: DispatchQoS
-    private let targetQueue: DispatchQueue
-    private let notificationQueue: DispatchQueue
-    private var isRunning: Bool = false
-    private var latestPath: NWPath?
+    private let queue: DispatchQueue
+    private var notifierRunning: Bool = false
+    private var lastStatus: Connection?
+    private var host: String?
 
-    private func handlePathUpdate(_ path: NWPath) {
-        latestPath = path
-        let status = map(path: path)
-
-        notificationQueue.async { [weak self] in
-            guard let self else { return }
-            switch status {
-            case .unavailable:
-                self.whenUnreachable?(self)
-            case .wifi, .cellular:
-                self.whenReachable?(self)
-            }
-            self.notificationCenter.post(name: .reachabilityChanged, object: self)
-        }
-    }
-
-    private func map(path: NWPath) -> Connection {
+    // Map NWPath → legacy Connection
+    private static func map(path: NWPath, allowsCellular: Bool) -> Connection {
         guard path.status == .satisfied else { return .unavailable }
 
-        if path.usesInterfaceType(.cellular), allowsCellularConnection == false {
-            return .unavailable
+        // Treat Wi-Fi and Wired Ethernet both as "wifi" for legacy parity.
+        if path.usesInterfaceType(.wifi) || path.usesInterfaceType(.wiredEthernet) {
+            return .wifi
         }
 
-        if path.usesInterfaceType(.wifi)          { return .wifi }
-        if path.usesInterfaceType(.wiredEthernet) { return .wifi }
-        if path.usesInterfaceType(.cellular)      { return .cellular }
-        if path.usesInterfaceType(.loopback)      { return .unavailable }
+        if allowsCellular && path.usesInterfaceType(.cellular) {
+            return .cellular
+        }
 
-        return .wifi
+        // Satisfied but only loopback/other → unavailable in legacy model.
+        return .unavailable
     }
-}
-
-// MARK: - Errors
-public enum MRReachabilityError: Error {
-    case failedToCreateWithAddress(sockaddr, Int32)
-    case failedToCreateWithHostname(String, Int32)
-    case unableToSetCallback(Int32)
-    case unableToSetDispatchQueue(Int32)
-    case unableToGetFlags(Int32)
-}
-
-// MARK: - Notification Name
-public extension NSNotification.Name {
-    static let reachabilityChanged = Notification.Name("reachabilityChanged")
 }
