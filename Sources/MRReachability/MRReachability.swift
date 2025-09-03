@@ -41,11 +41,11 @@ public extension Notification.Name {
 }
 
 @available(iOS 12.0, macOS 10.14, tvOS 12.0, watchOS 5.0, *)
-public final class Reachability: @unchecked Sendable, CustomStringConvertible {
+public final class MRReachability: @unchecked Sendable, CustomStringConvertible {
 
     // MARK: - Legacy callback aliases
-    public typealias NetworkReachable   = (Reachability) -> Void
-    public typealias NetworkUnreachable = (Reachability) -> Void
+    public typealias NetworkReachable   = (MRReachability) -> Void
+    public typealias NetworkUnreachable = (MRReachability) -> Void
 
     // MARK: - Connection (legacy 3-state), Sendable for Swift 6
     public enum Connection: String, Sendable, CustomStringConvertible {
